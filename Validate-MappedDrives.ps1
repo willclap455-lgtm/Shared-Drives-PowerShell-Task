@@ -25,6 +25,14 @@ Suppresses Read-Host prompts. Repair decisions are taken from -DefaultRepairYes.
 When -NonInteractive is used, repairs are automatically approved if this switch
 is set; otherwise repairs are declined.
 
+.PARAMETER Credential
+Optional credential to use when a mapping attempt fails with access denied.
+If omitted, the script prompts with Get-Credential when needed (interactive mode).
+
+.PARAMETER DoNotStoreCredential
+Prevents the script from saving prompted/supplied credentials to Windows
+Credential Manager via cmdkey.exe.
+
 .EXAMPLE
 .\Validate-MappedDrives.ps1
 Runs interactively. Prompts y/n for each missing or mismatched mapping.
@@ -36,6 +44,10 @@ Shows what would be removed/recreated without making changes.
 .EXAMPLE
 .\Validate-MappedDrives.ps1 -SkipPlatformChecks -NonInteractive
 Testing mode: skips platform checks and evaluates discrepancies without repairs.
+
+.EXAMPLE
+.\Validate-MappedDrives.ps1 -Credential (Get-Credential)
+Supplies credentials up front for any access-denied mapping retries.
 
 .INPUTS
 None. The script uses the hardcoded mapping array in this file.
@@ -64,7 +76,9 @@ https://learn.microsoft.com/powershell/module/microsoft.powershell.management/ne
 param(
     [switch]$SkipPlatformChecks,
     [switch]$NonInteractive,
-    [switch]$DefaultRepairYes
+    [switch]$DefaultRepairYes,
+    [PSCredential]$Credential,
+    [switch]$DoNotStoreCredential
 )
 
 Set-StrictMode -Version Latest
@@ -178,7 +192,10 @@ function Repair-MappedDrive {
         [Parameter(Mandatory)]
         [string]$ExpectedPath,
 
-        [switch]$ExistsWithWrongPath
+        [switch]$ExistsWithWrongPath,
+        [PSCredential]$Credential,
+        [switch]$DoNotStoreCredential,
+        [switch]$NonInteractive
     )
 
     if ($ExistsWithWrongPath) {
@@ -188,9 +205,97 @@ function Repair-MappedDrive {
         }
     }
 
-    if ($PSCmdlet.ShouldProcess("$DriveLetter`:", "Create mapping to '$ExpectedPath'")) {
+    if (-not $PSCmdlet.ShouldProcess("$DriveLetter`:", "Create mapping to '$ExpectedPath'")) {
+        return
+    }
+
+    try {
         New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -ErrorAction Stop | Out-Null
         Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath'."
+    }
+    catch {
+        $isAccessDenied = ($_.Exception -is [System.UnauthorizedAccessException]) -or ($_.Exception.Message -match "(?i)access is denied")
+        if (-not $isAccessDenied) {
+            throw
+        }
+
+        Write-Warning "Access denied while mapping drive $DriveLetter`: to '$ExpectedPath'. Attempting credentialed mapping."
+
+        $credentialToUse = $Credential
+        if (-not $credentialToUse) {
+            if ($NonInteractive) {
+                throw "Access denied mapping drive $DriveLetter`: and no -Credential was provided in non-interactive mode."
+            }
+
+            $credentialToUse = Get-Credential -Message "Enter credentials for '$ExpectedPath' (drive $DriveLetter`:)"
+        }
+
+        if (-not $DoNotStoreCredential) {
+            Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
+        }
+
+        New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
+        Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using supplied credentials."
+    }
+}
+
+function Get-ServerNameFromUncPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    if ($Path -match "^[\\]{2}([^\\]+)\\") {
+        return $Matches[1]
+    }
+
+    return $null
+}
+
+function Save-CredentialToWindowsCredentialManager {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [PSCredential]$Credential
+    )
+
+    if (-not $IsWindows) {
+        return
+    }
+
+    $server = Get-ServerNameFromUncPath -Path $Path
+    if ([string]::IsNullOrWhiteSpace($server)) {
+        Write-Warning "Could not extract server name from '$Path'; skipping Credential Manager save."
+        return
+    }
+
+    $cmdKey = Get-Command -Name "cmdkey.exe" -ErrorAction SilentlyContinue
+    if (-not $cmdKey) {
+        Write-Warning "cmdkey.exe was not found; skipping Credential Manager save."
+        return
+    }
+
+    $bstr = [IntPtr]::Zero
+    try {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+        $plainTextPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+
+        $cmdOutput = & $cmdKey.Source /add:$server /user:$($Credential.UserName) /pass:$plainTextPassword 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Failed to save credential in Credential Manager for '$server'. cmdkey output: $cmdOutput"
+            return
+        }
+
+        Write-Host "Saved credential for '$server' in Windows Credential Manager."
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
     }
 }
 
@@ -247,7 +352,7 @@ foreach ($mapping in $ExpectedDriveMappings) {
         continue
     }
 
-    Repair-MappedDrive -DriveLetter $driveLetter -ExpectedPath $expectedPath -ExistsWithWrongPath:$exists
+    Repair-MappedDrive -DriveLetter $driveLetter -ExpectedPath $expectedPath -ExistsWithWrongPath:$exists -Credential $Credential -DoNotStoreCredential:$DoNotStoreCredential -NonInteractive:$NonInteractive
     $repairsPerformed++
 }
 
