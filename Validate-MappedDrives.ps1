@@ -209,6 +209,113 @@ function Test-IsAuthenticationFailure {
     return $combinedMessage -match "(?i)(access is denied|specified network password is not correct|logon failure|unknown user name or bad password|username or password is incorrect)"
 }
 
+function Test-IsRememberedConnectionFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $messages = New-Object System.Collections.Generic.List[string]
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if (-not [string]::IsNullOrWhiteSpace($exception.Message)) {
+            $messages.Add($exception.Message)
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    if ($messages.Count -eq 0) {
+        $messages.Add([string]$ErrorRecord)
+    }
+
+    $combinedMessage = ($messages -join "`n")
+    return $combinedMessage -match "(?i)(remembered connection to another network resource|device name is already in use)"
+}
+
+function Clear-RememberedDriveConnection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter
+    )
+
+    $normalizedDriveLetter = Normalize-DriveLetter -DriveLetter $DriveLetter
+    $driveWithColon = "$normalizedDriveLetter`:"
+
+    try {
+        Remove-PSDrive -Name $normalizedDriveLetter -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Warning "Failed to remove existing PSDrive '$driveWithColon' before retry: $($_.Exception.Message)"
+    }
+
+    if (-not $IsWindows) {
+        return
+    }
+
+    $netCommand = Get-Command -Name "net.exe" -ErrorAction SilentlyContinue
+    if (-not $netCommand) {
+        Write-Warning "net.exe was not found; unable to clear remembered connection for drive $driveWithColon."
+        return
+    }
+
+    $netOutput = & $netCommand.Source use $driveWithColon /delete /y 2>&1
+    $netOutputText = ($netOutput -join [Environment]::NewLine)
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Cleared remembered connection for drive $driveWithColon."
+        return
+    }
+
+    if ($netOutputText -match "(?i)(network connection could not be found|no entries in the list|network connection does not exist)") {
+        return
+    }
+
+    Write-Warning "Unable to clear remembered connection for drive $driveWithColon. net use output: $netOutputText"
+}
+
+function New-MappedDriveWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedPath,
+
+        [PSCredential]$Credential
+    )
+
+    $newPsDriveParams = @{
+        Name       = $DriveLetter
+        PSProvider = "FileSystem"
+        Root       = $ExpectedPath
+        Persist    = $true
+        Scope      = "Global"
+        ErrorAction = "Stop"
+    }
+
+    if ($Credential) {
+        $newPsDriveParams["Credential"] = $Credential
+    }
+
+    try {
+        New-PSDrive @newPsDriveParams | Out-Null
+        return
+    }
+    catch {
+        if (-not (Test-IsRememberedConnectionFailure -ErrorRecord $_)) {
+            throw
+        }
+
+        Write-Warning "Drive $DriveLetter`: has a remembered connection conflict. Clearing stale connection and retrying."
+        Clear-RememberedDriveConnection -DriveLetter $DriveLetter
+        New-PSDrive @newPsDriveParams | Out-Null
+    }
+}
+
 function Repair-MappedDrive {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -236,7 +343,7 @@ function Repair-MappedDrive {
     }
 
     try {
-        New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -ErrorAction Stop | Out-Null
+        New-MappedDriveWithRetry -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath
         Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath'."
     }
     catch {
@@ -262,7 +369,7 @@ function Repair-MappedDrive {
                 Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
             }
 
-            New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
+            New-MappedDriveWithRetry -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath -Credential $credentialToUse
             Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using supplied credentials."
         }
         catch {
@@ -282,7 +389,7 @@ function Repair-MappedDrive {
             }
 
             try {
-                New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
+                New-MappedDriveWithRetry -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath -Credential $credentialToUse
                 Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using re-entered credentials."
             }
             catch {
