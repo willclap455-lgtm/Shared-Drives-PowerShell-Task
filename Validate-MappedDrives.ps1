@@ -526,3 +526,15 @@ if ($issuesFound -eq 0) {
 else {
     Write-Host "Validation complete. Discrepancies: $issuesFound | Repairs attempted: $repairsPerformed."
 }
+
+if (-not $NonInteractive) {
+    Write-Host "Press any key to continue ..."
+
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    catch {
+        # Fallback for hosts that do not support RawUI key reads.
+        [void](Read-Host -Prompt "Press Enter to continue")
+    }
+}
