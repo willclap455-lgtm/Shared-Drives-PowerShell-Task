@@ -26,7 +26,8 @@ When -NonInteractive is used, repairs are automatically approved if this switch
 is set; otherwise repairs are declined.
 
 .PARAMETER Credential
-Optional credential to use when a mapping attempt fails with access denied.
+Optional credential to use when a mapping attempt fails with authentication errors
+such as access denied or invalid password.
 If omitted, the script prompts with Get-Credential when needed (interactive mode).
 
 .PARAMETER DoNotStoreCredential
@@ -183,6 +184,31 @@ function Should-RepairMapping {
     }
 }
 
+function Test-IsAuthenticationFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $messages = New-Object System.Collections.Generic.List[string]
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if (-not [string]::IsNullOrWhiteSpace($exception.Message)) {
+            $messages.Add($exception.Message)
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    if ($messages.Count -eq 0) {
+        $messages.Add([string]$ErrorRecord)
+    }
+
+    $combinedMessage = ($messages -join "`n")
+    return $combinedMessage -match "(?i)(access is denied|specified network password is not correct|logon failure|unknown user name or bad password|username or password is incorrect)"
+}
+
 function Repair-MappedDrive {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -214,28 +240,59 @@ function Repair-MappedDrive {
         Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath'."
     }
     catch {
-        $isAccessDenied = ($_.Exception -is [System.UnauthorizedAccessException]) -or ($_.Exception.Message -match "(?i)access is denied")
-        if (-not $isAccessDenied) {
+        if (-not (Test-IsAuthenticationFailure -ErrorRecord $_)) {
             throw
         }
 
-        Write-Warning "Access denied while mapping drive $DriveLetter`: to '$ExpectedPath'. Attempting credentialed mapping."
+        Write-Warning "Authentication failed while mapping drive $DriveLetter`: to '$ExpectedPath'. Attempting credentialed mapping."
 
         $credentialToUse = $Credential
+        $hasPromptedForCredential = $false
         if (-not $credentialToUse) {
             if ($NonInteractive) {
-                throw "Access denied mapping drive $DriveLetter`: and no -Credential was provided in non-interactive mode."
+                throw "Authentication failed mapping drive $DriveLetter`: and no -Credential was provided in non-interactive mode."
             }
 
             $credentialToUse = Get-Credential -Message "Enter credentials for '$ExpectedPath' (drive $DriveLetter`:)"
+            $hasPromptedForCredential = $true
         }
 
-        if (-not $DoNotStoreCredential) {
-            Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
-        }
+        try {
+            if (-not $DoNotStoreCredential) {
+                Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
+            }
 
-        New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
-        Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using supplied credentials."
+            New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
+            Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using supplied credentials."
+        }
+        catch {
+            if (-not (Test-IsAuthenticationFailure -ErrorRecord $_)) {
+                throw
+            }
+
+            if ($NonInteractive -or $hasPromptedForCredential) {
+                throw "Credential retry failed mapping drive $DriveLetter`: to '$ExpectedPath'."
+            }
+
+            Write-Warning "The supplied credential for drive $DriveLetter`: was rejected. Please enter credentials one more time."
+            $credentialToUse = Get-Credential -Message "Credential was rejected for '$ExpectedPath' (drive $DriveLetter`:). Enter credentials one final time."
+
+            if (-not $DoNotStoreCredential) {
+                Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
+            }
+
+            try {
+                New-PSDrive -Name $DriveLetter -PSProvider FileSystem -Root $ExpectedPath -Persist -Scope Global -Credential $credentialToUse -ErrorAction Stop | Out-Null
+                Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using re-entered credentials."
+            }
+            catch {
+                if (Test-IsAuthenticationFailure -ErrorRecord $_) {
+                    throw "Credential retry failed mapping drive $DriveLetter`: to '$ExpectedPath'."
+                }
+
+                throw
+            }
+        }
     }
 }
 
