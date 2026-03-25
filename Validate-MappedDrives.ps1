@@ -209,6 +209,31 @@ function Test-IsAuthenticationFailure {
     return $combinedMessage -match "(?i)(access is denied|specified network password is not correct|logon failure|unknown user name or bad password|username or password is incorrect)"
 }
 
+function Test-IsTrustRelationshipFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $messages = New-Object System.Collections.Generic.List[string]
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if (-not [string]::IsNullOrWhiteSpace($exception.Message)) {
+            $messages.Add($exception.Message)
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    if ($messages.Count -eq 0) {
+        $messages.Add([string]$ErrorRecord)
+    }
+
+    $combinedMessage = ($messages -join "`n")
+    return $combinedMessage -match "(?i)(trust relationship between the primary domain and the trusted domain failed|trust relationship between this workstation and the primary domain failed)"
+}
+
 function Test-IsRememberedConnectionFailure {
     [CmdletBinding()]
     param(
@@ -347,21 +372,19 @@ function Repair-MappedDrive {
         Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath'."
     }
     catch {
-        if (-not (Test-IsAuthenticationFailure -ErrorRecord $_)) {
+        if (-not ( (Test-IsAuthenticationFailure -ErrorRecord $_) -or (Test-IsTrustRelationshipFailure -ErrorRecord $_) )) {
             throw
         }
 
-        Write-Warning "Authentication failed while mapping drive $DriveLetter`: to '$ExpectedPath'. Attempting credentialed mapping."
+        Write-Warning "Authentication/trust failed while mapping drive $DriveLetter`: to '$ExpectedPath'. Attempting credentialed mapping."
 
         $credentialToUse = $Credential
-        $hasPromptedForCredential = $false
         if (-not $credentialToUse) {
             if ($NonInteractive) {
-                throw "Authentication failed mapping drive $DriveLetter`: and no -Credential was provided in non-interactive mode."
+                throw "Authentication/trust failed mapping drive $DriveLetter`: and no -Credential was provided in non-interactive mode."
             }
 
             $credentialToUse = Get-Credential -Message "Enter credentials for '$ExpectedPath' (drive $DriveLetter`:)"
-            $hasPromptedForCredential = $true
         }
 
         try {
@@ -373,16 +396,16 @@ function Repair-MappedDrive {
             Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using supplied credentials."
         }
         catch {
-            if (-not (Test-IsAuthenticationFailure -ErrorRecord $_)) {
+            if (-not ( (Test-IsAuthenticationFailure -ErrorRecord $_) -or (Test-IsTrustRelationshipFailure -ErrorRecord $_) )) {
                 throw
             }
 
-            if ($NonInteractive -or $hasPromptedForCredential) {
+            if ($NonInteractive) {
                 throw "Credential retry failed mapping drive $DriveLetter`: to '$ExpectedPath'."
             }
 
-            Write-Warning "The supplied credential for drive $DriveLetter`: was rejected. Please enter credentials one more time."
-            $credentialToUse = Get-Credential -Message "Credential was rejected for '$ExpectedPath' (drive $DriveLetter`:). Enter credentials one final time."
+            Write-Warning "Credential attempt for drive $DriveLetter`: failed due to authentication/trust. Please enter credentials one more time."
+            $credentialToUse = Get-Credential -Message "Credential was rejected or trust failed for '$ExpectedPath' (drive $DriveLetter`:). Enter credentials one final time."
 
             if (-not $DoNotStoreCredential) {
                 Save-CredentialToWindowsCredentialManager -Path $ExpectedPath -Credential $credentialToUse
@@ -393,7 +416,7 @@ function Repair-MappedDrive {
                 Write-Host "Mapped drive $DriveLetter`: to '$ExpectedPath' using re-entered credentials."
             }
             catch {
-                if (Test-IsAuthenticationFailure -ErrorRecord $_) {
+                if ( (Test-IsAuthenticationFailure -ErrorRecord $_) -or (Test-IsTrustRelationshipFailure -ErrorRecord $_) ) {
                     throw "Credential retry failed mapping drive $DriveLetter`: to '$ExpectedPath'."
                 }
 
