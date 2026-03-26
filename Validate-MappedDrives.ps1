@@ -206,7 +206,7 @@ function Test-IsAuthenticationFailure {
     }
 
     $combinedMessage = ($messages -join "`n")
-    return $combinedMessage -match "(?i)(access is denied|specified network password is not correct|logon failure|unknown user name or bad password|username or password is incorrect)"
+    return $combinedMessage -match "(?i)(access is denied|specified network password is not correct|password is invalid|logon failure|unknown user name or bad password|username or password is incorrect|system error 86)"
 }
 
 function Test-IsTrustRelationshipFailure {
