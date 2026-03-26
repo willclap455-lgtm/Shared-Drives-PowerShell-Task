@@ -427,6 +427,52 @@ function Clear-RememberedServerConnections {
     }
 }
 
+function New-MappedDriveUsingNetUse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedPath,
+
+        [PSCredential]$Credential
+    )
+
+    if (-not $IsWindows) {
+        throw "net use fallback is only supported on Windows."
+    }
+
+    $netCommand = Get-Command -Name "net.exe" -ErrorAction SilentlyContinue
+    if (-not $netCommand) {
+        throw "net.exe was not found; unable to map drive $DriveLetter`: via net use fallback."
+    }
+
+    $normalizedDriveLetter = Normalize-DriveLetter -DriveLetter $DriveLetter
+    $driveWithColon = "$normalizedDriveLetter`:"
+    $netUseArguments = @("use", $driveWithColon, $ExpectedPath, "/persistent:yes")
+    $bstr = [IntPtr]::Zero
+
+    try {
+        if ($Credential) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainTextPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            $netUseArguments += @($plainTextPassword, "/user:$($Credential.UserName)")
+        }
+
+        $netOutput = & $netCommand.Source @netUseArguments 2>&1
+        $netOutputText = ($netOutput -join [Environment]::NewLine)
+        if ($LASTEXITCODE -ne 0) {
+            throw "net use fallback failed for drive $driveWithColon to '$ExpectedPath'. net use output: $netOutputText"
+        }
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+
 function New-MappedDriveWithRetry {
     [CmdletBinding()]
     param(
@@ -460,7 +506,13 @@ function New-MappedDriveWithRetry {
         if (Test-IsRememberedConnectionFailure -ErrorRecord $_) {
             Write-Warning "Drive $DriveLetter`: has a remembered connection conflict. Clearing stale connection and retrying."
             Clear-RememberedDriveConnection -DriveLetter $DriveLetter
-            New-PSDrive @newPsDriveParams | Out-Null
+            try {
+                New-PSDrive @newPsDriveParams | Out-Null
+            }
+            catch {
+                Write-Warning "Drive $DriveLetter`: still failed after clearing remembered connection. Falling back to net use."
+                New-MappedDriveUsingNetUse -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath -Credential $Credential
+            }
             return
         }
 
@@ -469,7 +521,13 @@ function New-MappedDriveWithRetry {
             Clear-RememberedDriveConnection -DriveLetter $DriveLetter
             Clear-RememberedPathConnection -Path $ExpectedPath
             Clear-RememberedServerConnections -Path $ExpectedPath
-            New-PSDrive @newPsDriveParams | Out-Null
+            try {
+                New-PSDrive @newPsDriveParams | Out-Null
+            }
+            catch {
+                Write-Warning "Drive $DriveLetter`: still failed after reset/retry. Falling back to net use."
+                New-MappedDriveUsingNetUse -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath -Credential $Credential
+            }
             return
         }
 
