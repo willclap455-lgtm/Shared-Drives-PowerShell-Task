@@ -259,6 +259,31 @@ function Test-IsRememberedConnectionFailure {
     return $combinedMessage -match "(?i)(remembered connection to another network resource|device name is already in use)"
 }
 
+function Test-IsNetworkResourceTypeFailure {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $messages = New-Object System.Collections.Generic.List[string]
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        if (-not [string]::IsNullOrWhiteSpace($exception.Message)) {
+            $messages.Add($exception.Message)
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    if ($messages.Count -eq 0) {
+        $messages.Add([string]$ErrorRecord)
+    }
+
+    $combinedMessage = ($messages -join "`n")
+    return $combinedMessage -match "(?i)(network resource type is not correct)"
+}
+
 function Clear-RememberedDriveConnection {
     [CmdletBinding()]
     param(
@@ -301,6 +326,43 @@ function Clear-RememberedDriveConnection {
     Write-Warning "Unable to clear remembered connection for drive $driveWithColon. net use output: $netOutputText"
 }
 
+function Clear-RememberedPathConnection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $normalizedPath = Normalize-MappingPath -Path $Path
+    if (-not ($normalizedPath -like "\\*")) {
+        return
+    }
+
+    if (-not $IsWindows) {
+        return
+    }
+
+    $netCommand = Get-Command -Name "net.exe" -ErrorAction SilentlyContinue
+    if (-not $netCommand) {
+        Write-Warning "net.exe was not found; unable to clear remembered connection for '$normalizedPath'."
+        return
+    }
+
+    $netOutput = & $netCommand.Source use $normalizedPath /delete /y 2>&1
+    $netOutputText = ($netOutput -join [Environment]::NewLine)
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Cleared remembered connection for '$normalizedPath'."
+        return
+    }
+
+    if ($netOutputText -match "(?i)(network connection could not be found|no entries in the list|network connection does not exist)") {
+        return
+    }
+
+    Write-Warning "Unable to clear remembered connection for '$normalizedPath'. net use output: $netOutputText"
+}
+
 function New-MappedDriveWithRetry {
     [CmdletBinding()]
     param(
@@ -331,13 +393,22 @@ function New-MappedDriveWithRetry {
         return
     }
     catch {
-        if (-not (Test-IsRememberedConnectionFailure -ErrorRecord $_)) {
-            throw
+        if (Test-IsRememberedConnectionFailure -ErrorRecord $_) {
+            Write-Warning "Drive $DriveLetter`: has a remembered connection conflict. Clearing stale connection and retrying."
+            Clear-RememberedDriveConnection -DriveLetter $DriveLetter
+            New-PSDrive @newPsDriveParams | Out-Null
+            return
         }
 
-        Write-Warning "Drive $DriveLetter`: has a remembered connection conflict. Clearing stale connection and retrying."
-        Clear-RememberedDriveConnection -DriveLetter $DriveLetter
-        New-PSDrive @newPsDriveParams | Out-Null
+        if (Test-IsNetworkResourceTypeFailure -ErrorRecord $_) {
+            Write-Warning "Drive $DriveLetter`: failed with 'network resource type is not correct'. Resetting drive/share connections and retrying."
+            Clear-RememberedDriveConnection -DriveLetter $DriveLetter
+            Clear-RememberedPathConnection -Path $ExpectedPath
+            New-PSDrive @newPsDriveParams | Out-Null
+            return
+        }
+
+        throw
     }
 }
 
