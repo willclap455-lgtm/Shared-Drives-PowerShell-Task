@@ -363,6 +363,70 @@ function Clear-RememberedPathConnection {
     Write-Warning "Unable to clear remembered connection for '$normalizedPath'. net use output: $netOutputText"
 }
 
+function Clear-RememberedServerConnections {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $normalizedPath = Normalize-MappingPath -Path $Path
+    if (-not ($normalizedPath -like "\\*")) {
+        return
+    }
+
+    if (-not $IsWindows) {
+        return
+    }
+
+    $server = Get-ServerNameFromUncPath -Path $normalizedPath
+    if ([string]::IsNullOrWhiteSpace($server)) {
+        return
+    }
+
+    $netCommand = Get-Command -Name "net.exe" -ErrorAction SilentlyContinue
+    if (-not $netCommand) {
+        Write-Warning "net.exe was not found; unable to clear remembered connections for '\\$server'."
+        return
+    }
+
+    $netUseOutput = & $netCommand.Source use 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $netUseText = ($netUseOutput -join [Environment]::NewLine)
+        Write-Warning "Unable to enumerate current net use entries while clearing '\\$server'. net use output: $netUseText"
+        return
+    }
+
+    $remotePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in $netUseOutput) {
+        $lineText = [string]$line
+        if ($lineText -match '(\\\\[^\\\s]+\\[^\s]+)') {
+            $remotePath = (Normalize-MappingPath -Path $Matches[1])
+            if ($remotePath -like "\\$server\*") {
+                [void]$remotePaths.Add($remotePath)
+            }
+        }
+    }
+
+    [void]$remotePaths.Add("\\$server\IPC$")
+
+    foreach ($remotePath in $remotePaths) {
+        $deleteOutput = & $netCommand.Source use $remotePath /delete /y 2>&1
+        $deleteOutputText = ($deleteOutput -join [Environment]::NewLine)
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Cleared remembered connection for '$remotePath'."
+            continue
+        }
+
+        if ($deleteOutputText -match "(?i)(network connection could not be found|no entries in the list|network connection does not exist)") {
+            continue
+        }
+
+        Write-Warning "Unable to clear remembered connection for '$remotePath'. net use output: $deleteOutputText"
+    }
+}
+
 function New-MappedDriveWithRetry {
     [CmdletBinding()]
     param(
@@ -404,6 +468,7 @@ function New-MappedDriveWithRetry {
             Write-Warning "Drive $DriveLetter`: failed with 'network resource type is not correct'. Resetting drive/share connections and retrying."
             Clear-RememberedDriveConnection -DriveLetter $DriveLetter
             Clear-RememberedPathConnection -Path $ExpectedPath
+            Clear-RememberedServerConnections -Path $ExpectedPath
             New-PSDrive @newPsDriveParams | Out-Null
             return
         }
