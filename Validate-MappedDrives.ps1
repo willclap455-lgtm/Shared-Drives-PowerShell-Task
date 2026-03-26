@@ -427,6 +427,163 @@ function Clear-RememberedServerConnections {
     }
 }
 
+function Get-DriveTypeDisplayName {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [uint32]$DriveType
+    )
+
+    switch ($DriveType) {
+        0 { return "Unknown" }
+        1 { return "NoRootDirectory" }
+        2 { return "RemovableDisk" }
+        3 { return "LocalDisk" }
+        4 { return "NetworkDrive" }
+        5 { return "CompactDisc" }
+        6 { return "RamDisk" }
+        default { return "Other($DriveType)" }
+    }
+}
+
+function Get-DriveLetterUsageDescription {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter
+    )
+
+    $normalizedDriveLetter = Normalize-DriveLetter -DriveLetter $DriveLetter
+    $driveWithColon = "$normalizedDriveLetter`:"
+    $details = New-Object System.Collections.Generic.List[string]
+
+    $psDrive = Get-PSDrive -Name $normalizedDriveLetter -ErrorAction SilentlyContinue
+    if ($psDrive) {
+        foreach ($entry in @($psDrive)) {
+            $providerName = if ($entry.Provider) { $entry.Provider.Name } else { "<unknown>" }
+            $displayRoot = if ([string]::IsNullOrWhiteSpace($entry.DisplayRoot)) { "<none>" } else { $entry.DisplayRoot }
+            $details.Add("PSDrive provider '$providerName', root '$($entry.Root)', display root '$displayRoot'")
+        }
+    }
+
+    if ($IsWindows) {
+        try {
+            $logicalDisk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$driveWithColon'" -ErrorAction SilentlyContinue
+            if ($logicalDisk) {
+                $driveTypeName = Get-DriveTypeDisplayName -DriveType ([uint32]$logicalDisk.DriveType)
+                $providerName = if ([string]::IsNullOrWhiteSpace($logicalDisk.ProviderName)) { "<none>" } else { $logicalDisk.ProviderName }
+                $details.Add("Win32_LogicalDisk type '$driveTypeName', provider '$providerName'")
+            }
+        }
+        catch {
+            $details.Add("Win32_LogicalDisk lookup failed: $($_.Exception.Message)")
+        }
+
+        $substCommand = Get-Command -Name "subst.exe" -ErrorAction SilentlyContinue
+        if ($substCommand) {
+            $substOutput = & $substCommand.Source 2>&1
+            foreach ($line in $substOutput) {
+                $lineText = [string]$line
+                if ($lineText -match "^\s*$normalizedDriveLetter`:\\\s*=>\s*(.+)\s*$") {
+                    $details.Add("SUBST mapping to '$($Matches[1])'")
+                }
+            }
+        }
+    }
+
+    if ($details.Count -eq 0) {
+        return "no explicit drive-letter usage detected"
+    }
+
+    return ($details -join "; ")
+}
+
+function Clear-SubstDriveConnection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter
+    )
+
+    if (-not $IsWindows) {
+        return
+    }
+
+    $normalizedDriveLetter = Normalize-DriveLetter -DriveLetter $DriveLetter
+    $driveWithColon = "$normalizedDriveLetter`:"
+    $substCommand = Get-Command -Name "subst.exe" -ErrorAction SilentlyContinue
+    if (-not $substCommand) {
+        return
+    }
+
+    $substOutput = & $substCommand.Source $driveWithColon /d 2>&1
+    $substOutputText = ($substOutput -join [Environment]::NewLine)
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Cleared SUBST mapping for drive $driveWithColon."
+        return
+    }
+
+    if ($substOutputText -match "(?i)(invalid parameter|the system cannot find the drive specified|there are no substituted drives)") {
+        return
+    }
+
+    Write-Warning "Unable to clear SUBST mapping for drive $driveWithColon. subst output: $substOutputText"
+}
+
+function New-MappedDriveWithNetUse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$DriveLetter,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedPath,
+
+        [PSCredential]$Credential
+    )
+
+    if (-not $IsWindows) {
+        throw "net use fallback is only supported on Windows."
+    }
+
+    $normalizedDriveLetter = Normalize-DriveLetter -DriveLetter $DriveLetter
+    $driveWithColon = "$normalizedDriveLetter`:"
+    $netCommand = Get-Command -Name "net.exe" -ErrorAction SilentlyContinue
+    if (-not $netCommand) {
+        throw "net.exe was not found; unable to use net use fallback."
+    }
+
+    $netArgs = New-Object System.Collections.Generic.List[string]
+    [void]$netArgs.Add("use")
+    [void]$netArgs.Add($driveWithColon)
+    [void]$netArgs.Add($ExpectedPath)
+    [void]$netArgs.Add("/persistent:yes")
+
+    $bstr = [IntPtr]::Zero
+    try {
+        if ($Credential) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Credential.Password)
+            $plainTextPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            [void]$netArgs.Add($plainTextPassword)
+            [void]$netArgs.Add("/user:$($Credential.UserName)")
+        }
+
+        $netOutput = & $netCommand.Source @netArgs 2>&1
+        $netOutputText = ($netOutput -join [Environment]::NewLine)
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Mapped drive $driveWithColon via net use fallback."
+            return
+        }
+
+        throw "net use fallback failed for drive $driveWithColon to '$ExpectedPath'. net use output: $netOutputText"
+    }
+    finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+
 function New-MappedDriveWithRetry {
     [CmdletBinding()]
     param(
@@ -469,7 +626,28 @@ function New-MappedDriveWithRetry {
             Clear-RememberedDriveConnection -DriveLetter $DriveLetter
             Clear-RememberedPathConnection -Path $ExpectedPath
             Clear-RememberedServerConnections -Path $ExpectedPath
-            New-PSDrive @newPsDriveParams | Out-Null
+            Clear-SubstDriveConnection -DriveLetter $DriveLetter
+
+            try {
+                New-PSDrive @newPsDriveParams | Out-Null
+                return
+            }
+            catch {
+                if (-not (Test-IsNetworkResourceTypeFailure -ErrorRecord $_)) {
+                    throw
+                }
+
+                Write-Warning "Drive $DriveLetter`: still reports resource-type conflicts after cleanup. Trying net use fallback."
+                try {
+                    New-MappedDriveWithNetUse -DriveLetter $DriveLetter -ExpectedPath $ExpectedPath -Credential $Credential
+                    return
+                }
+                catch {
+                    $usageDetails = Get-DriveLetterUsageDescription -DriveLetter $DriveLetter
+                    throw "Drive $DriveLetter`: mapping failed after retry and net use fallback. Drive-letter usage details: $usageDetails. Inner error: $($_.Exception.Message)"
+                }
+            }
+
             return
         }
 
